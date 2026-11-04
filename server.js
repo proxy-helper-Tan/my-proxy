@@ -1,6 +1,8 @@
 // server.js - OpenAI to NVIDIA NIM API Proxy (Optimized for Janitor AI)
-// v3.1 — YOUR v3.0 code with three additions (nothing removed):
-//   1. CUSTOM_PROMPT env var: your narrator rules injected server-side into every request
+// v3.2 — YOUR v3.0 code with three additions (nothing removed):
+//   1. CUSTOM PROMPT from prompt.txt: your narrator rules injected server-side into every
+//      request. Read from a FILE, not an env var — big env vars crash Render with
+//      "exec /bin/bash: argument list too long".
 //   2. ENABLE_THINKING_MODE=off: forces thinking OFF on thinking models, so the whole
 //      token budget goes to the story instead of hidden reasoning
 //   3. REASONING_EFFORT env var (optional): sends reasoning_effort to models that support it
@@ -29,8 +31,18 @@ const SHOW_REASONING = process.env.SHOW_REASONING === 'true' || false;
 //   anything else (or unset) = model default
 const THINKING_MODE = process.env.ENABLE_THINKING_MODE || 'default';
 
-// 📜 CUSTOM PROMPT - your narrator rules, injected server-side into every request
-const CUSTOM_PROMPT = process.env.CUSTOM_PROMPT || '';
+// 📜 CUSTOM PROMPT - your narrator rules, injected server-side into every request.
+// Loaded from prompt.txt in the repo root (env vars have a size limit on Render:
+// a rulebook that big causes "exec /bin/bash: argument list too long").
+// Env var CUSTOM_PROMPT still works as a fallback for short prompts.
+function loadCustomPrompt() {
+  try {
+    const text = require('fs').readFileSync(require('path').join(__dirname, 'prompt.txt'), 'utf8').trim();
+    if (text) return text;
+  } catch (e) { /* prompt.txt missing or unreadable — fall back to env */ }
+  return (process.env.CUSTOM_PROMPT || '').trim();
+}
+const CUSTOM_PROMPT = loadCustomPrompt();
 
 // 🧠 REASONING EFFORT - optional. 'low' = think less, write more story
 const REASONING_EFFORT = process.env.REASONING_EFFORT || '';
@@ -147,7 +159,7 @@ function stripUserBreakout(text) {
   const userLabels = [
     /^(User|Human|You|Me|Player)\s*[:：]/i,
     /^---+\s*$/,
-    /^*{0,3}\s*(User|Human|You|Me|Player)\s**{0,3}\s*[:：]/i
+    /^\*{0,3}\s*(User|Human|You|Me|Player)\s*\*{0,3}\s*[:：]/i
   ];
 
   for (const line of lines) {
@@ -289,6 +301,7 @@ app.get('/health', (req, res) => {
     thinking_mode: THINKING_MODE,
     reasoning_effort: REASONING_EFFORT || null,
     custom_prompt_injected: !!CUSTOM_PROMPT,
+    custom_prompt_source: require('fs').existsSync(require('path').join(__dirname, 'prompt.txt')) ? 'prompt.txt' : (CUSTOM_PROMPT ? 'env' : 'none'),
     nim_api_configured: !!NIM_API_KEY,
     available_models: Object.keys(MODEL_MAPPING).length,
     live_nim_models: liveModels ? liveModels.size : null,
@@ -368,7 +381,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     // 📜 CUSTOM PROMPT - your narrator rules, injected server-side into every request
-    // (set CUSTOM_PROMPT in Render environment variables; then remove the rules from
+    // (your rules live in prompt.txt in the repo; then remove the rules from
     //  the bot's Custom Prompt field in JanitorAI so they are not sent twice)
     if (CUSTOM_PROMPT) {
       messages.unshift({ role: 'system', content: CUSTOM_PROMPT });
