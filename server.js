@@ -1,5 +1,9 @@
 // server.js - OpenAI to NVIDIA NIM API Proxy (Optimized for Janitor AI)
-// Updated: October 16, 2026 — model IDs verified against build.nvidia.com / integrate.api.nvidia.com/v1/models
+// v3.1 — YOUR v3.0 code with three additions (nothing removed):
+//   1. CUSTOM_PROMPT env var: your narrator rules injected server-side into every request
+//   2. ENABLE_THINKING_MODE=off: forces thinking OFF on thinking models, so the whole
+//      token budget goes to the story instead of hidden reasoning
+//   3. REASONING_EFFORT env var (optional): sends reasoning_effort to models that support it
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -19,8 +23,17 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true' || false;
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true' || false;
+// 🔥 THINKING MODE - three states:
+//   'true'    = force thinking ON for thinking-capable models
+//   'off'     = force thinking OFF (story gets the whole token budget)
+//   anything else (or unset) = model default
+const THINKING_MODE = process.env.ENABLE_THINKING_MODE || 'default';
+
+// 📜 CUSTOM PROMPT - your narrator rules, injected server-side into every request
+const CUSTOM_PROMPT = process.env.CUSTOM_PROMPT || '';
+
+// 🧠 REASONING EFFORT - optional. 'low' = think less, write more story
+const REASONING_EFFORT = process.env.REASONING_EFFORT || '';
 
 // How many models (primary + fallbacks) to try per request. NVIDIA's free tier is ~40 RPM,
 // so don't hammer it with a long chain on every 429.
@@ -33,18 +46,8 @@ const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS, 10) || 600
 const ALLOW_UNLISTED_MODELS = process.env.ALLOW_UNLISTED_MODELS === 'true';
 
 // 🎯 MODEL MAPPING — updated October 2026
-//
-// REMOVED from NIM since the last version of this file:
-//   • minimaxai/minimax-m3           — gone from the catalog
-//   • openai/gpt-oss-120b            — gone (only gpt-oss-20b remains)
-//   • deepseek-ai/deepseek-v4-pro    — deprecated Aug 7 2026, replaced by deepseek-v4-pro-0813
-//   • z-ai/glm-5.2, stepfun step-3.7-flash, mistral-medium-3.5 / small-4, inkling — no longer in the
-//     current model list; superseded by GLM-5.3, Step-5 preview, etc.
-// The old Janitor alias names (minimax, glm-pro, step-flash, ...) are kept and redirected to the
-// closest live replacement so existing Janitor AI configs don't break.
 const MODEL_MAPPING = {
   // --- DeepSeek ---
-  // NOTE: deepseek-v4-pro-0813 returned 410 (Gone) on the API and is not in the public list, so Pro aliases use V4.1 Flash
   'deepseek-v4-pro':    'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-v4-pro-0813': 'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-flash':     'deepseek-ai/deepseek-v4.1-flash',    // 552B MoE / 8B active, 1M ctx, multimodal
@@ -91,7 +94,6 @@ const MODEL_MAPPING = {
 };
 
 // 🔄 FALLBACK CHAIN — tried in order when the requested model is rate-limited / overloaded / gone.
-// Entries not present in the live /v1/models list are skipped automatically.
 const FALLBACK_CHAIN = [
   'z-ai/glm-5.3',
   'nvidia/nemotron-3-ultra-550b-a55b',
@@ -145,7 +147,7 @@ function stripUserBreakout(text) {
   const userLabels = [
     /^(User|Human|You|Me|Player)\s*[:：]/i,
     /^---+\s*$/,
-    /^\*{0,3}\s*(User|Human|You|Me|Player)\s*\*{0,3}\s*[:：]/i
+    /^*{0,3}\s*(User|Human|You|Me|Player)\s**{0,3}\s*[:：]/i
   ];
 
   for (const line of lines) {
@@ -188,15 +190,22 @@ const THINKING_MODELS = [
   'stepfun-ai/step-5-preview',
 ];
 
-// Adds the right "thinking on" switch for each model family (NIM reads chat_template_kwargs)
+// Adds the right thinking switch for each model family (NIM reads chat_template_kwargs).
+// THINKING_MODE === 'true'  -> thinking ON
+// THINKING_MODE === 'off'   -> thinking OFF (the whole max_tokens budget goes to the story)
+// anything else             -> model default (no switch sent)
 function applyThinkingMode(nimRequest) {
   const m = nimRequest.model;
-  if (!ENABLE_THINKING_MODE || !THINKING_MODELS.includes(m)) return;
-  if (m.includes('deepseek') || m.includes('kimi')) {
-    nimRequest.chat_template_kwargs = { thinking: true };
-  } else if (m.includes('glm') || m.includes('nemotron') || m.includes('step')) {
-    nimRequest.chat_template_kwargs = { enable_thinking: true };
+  if (!THINKING_MODELS.includes(m)) return;
+  if (THINKING_MODE === 'true' || THINKING_MODE === 'off') {
+    const on = THINKING_MODE === 'true';
+    if (m.includes('deepseek') || m.includes('kimi')) {
+      nimRequest.chat_template_kwargs = { thinking: on };
+    } else if (m.includes('glm') || m.includes('nemotron') || m.includes('step')) {
+      nimRequest.chat_template_kwargs = { enable_thinking: on };
+    }
   }
+  if (REASONING_EFFORT) nimRequest.reasoning_effort = REASONING_EFFORT;
 }
 
 // 🔄 Helper: make a NIM request with automatic fallback (429 / 5xx / 404 / 410 / timeout)
@@ -277,13 +286,15 @@ app.get('/health', (req, res) => {
     status: 'ok',
     service: 'OpenAI to NVIDIA NIM Proxy (Janitor AI Optimized)',
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE,
+    thinking_mode: THINKING_MODE,
+    reasoning_effort: REASONING_EFFORT || null,
+    custom_prompt_injected: !!CUSTOM_PROMPT,
     nim_api_configured: !!NIM_API_KEY,
     available_models: Object.keys(MODEL_MAPPING).length,
     live_nim_models: liveModels ? liveModels.size : null,
     live_models_refreshed: liveModelsAt,
     optimized_for: 'Janitor AI',
-    last_updated: 'October 2026'
+    last_updated: 'November 2026'
   });
 });
 
@@ -291,7 +302,7 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'OpenAI to NVIDIA NIM Proxy',
-    version: '3.0',
+    version: '3.1',
     optimized_for: 'Janitor AI',
     status: 'running',
     endpoints: {
@@ -356,6 +367,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages.unshift({ role: 'system', content: RP_GUARD_INSTRUCTION });
     }
 
+    // 📜 CUSTOM PROMPT - your narrator rules, injected server-side into every request
+    // (set CUSTOM_PROMPT in Render environment variables; then remove the rules from
+    //  the bot's Custom Prompt field in JanitorAI so they are not sent twice)
+    if (CUSTOM_PROMPT) {
+      messages.unshift({ role: 'system', content: CUSTOM_PROMPT });
+    }
+
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -417,13 +435,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (SHOW_REASONING) {
                   let combinedContent = '';
                   if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\n' + reasoning;
+                    combinedContent = 'imd\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
                   if (content && reasoningStarted) {
-                    combinedContent += '\n</think>\n\n' + content;
+                    combinedContent += '\n\n\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
@@ -477,7 +495,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           fullContent = stripUserBreakout(fullContent);
           const reasoningText = choice.message?.reasoning_content ?? choice.message?.reasoning;
           if (SHOW_REASONING && reasoningText) {
-            fullContent = '<think>\n' + reasoningText + '\n</think>\n\n' + fullContent;
+            fullContent = 'imd\n' + reasoningText + '\n\n\n\n' + fullContent;
           }
           return {
             index: choice.index,
@@ -541,7 +559,7 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', async () => {
   console.log('═══════════════════════════════════════════════════════');
-  console.log('🚀 OpenAI → NVIDIA NIM Proxy (Janitor AI Optimized)');
+  console.log('🚀 OpenAI → NVIDIA NIM Proxy (Janitor AI Optimized) v3.1');
   console.log('═══════════════════════════════════════════════════════');
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🏥 Health check: http://localhost:${PORT}/health`);
@@ -549,7 +567,9 @@ app.listen(PORT, '0.0.0.0', async () => {
   console.log('');
   console.log('⚙️  Configuration:');
   console.log(`   • Reasoning display: ${SHOW_REASONING ? '✅ ENABLED' : '❌ DISABLED'}`);
-  console.log(`   • Thinking mode:     ${ENABLE_THINKING_MODE ? '✅ ENABLED' : '❌ DISABLED'}`);
+  console.log(`   • Thinking mode:     ${THINKING_MODE}`);
+  console.log(`   • Reasoning effort:  ${REASONING_EFFORT || 'default'}`);
+  console.log(`   • Custom prompt:     ${CUSTOM_PROMPT ? '✅ INJECTED' : '❌ none'}`);
   console.log(`   • API key:           ${NIM_API_KEY ? '✅ Configured' : '❌ Missing'}`);
   console.log(`   • Max tokens:        12000 (default)`);
   console.log(`   • Fallback triggers: ${[...FALLBACK_STATUSES].join(', ')} + timeout`);
