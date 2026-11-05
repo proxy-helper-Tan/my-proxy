@@ -448,13 +448,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (SHOW_REASONING) {
                   let combinedContent = '';
                   if (reasoning && !reasoningStarted) {
-                    combinedContent = 'imd\n' + reasoning;
+                    combinedContent = '<imd>\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
                   if (content && reasoningStarted) {
-                    combinedContent += '\n\n\n\n' + content;
+                    combinedContent += '\n</IMD>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
@@ -508,7 +508,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           fullContent = stripUserBreakout(fullContent);
           const reasoningText = choice.message?.reasoning_content ?? choice.message?.reasoning;
           if (SHOW_REASONING && reasoningText) {
-            fullContent = 'imd\n' + reasoningText + '\n\n\n\n' + fullContent;
+            fullContent = '<imd>\n' + reasoningText + '\n</IMD>\n\n' + fullContent;
           }
           return {
             index: choice.index,
