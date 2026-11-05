@@ -1,11 +1,13 @@
 // server.js - OpenAI to NVIDIA NIM API Proxy (Optimized for Janitor AI)
-// v3.2 — YOUR v3.0 code with three additions (nothing removed):
+// v3.3 — YOUR v3.0 code with four additions (nothing removed):
 //   1. CUSTOM PROMPT from prompt.txt: your narrator rules injected server-side into every
 //      request. Read from a FILE, not an env var — big env vars crash Render with
 //      "exec /bin/bash: argument list too long".
 //   2. ENABLE_THINKING_MODE=off: forces thinking OFF on thinking models, so the whole
 //      token budget goes to the story instead of hidden reasoning
 //   3. REASONING_EFFORT env var (optional): sends reasoning_effort to models that support it
+//   4. SHOW_REASONING now passes reasoning through in the reasoning_content field, which
+//      JanitorAI renders natively as the collapsible ". . . thinking" box.
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -411,7 +413,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
 
       let buffer = '';
-      let reasoningStarted = false;
       let contentAccumulator = '';
       let flushedUpTo = 0;
       const LOOKAHEAD = 200;
@@ -446,24 +447,18 @@ app.post('/v1/chat/completions', async (req, res) => {
                 const content = delta.content;
 
                 if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<imd>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
+                  // Pass reasoning through UNTOUCHED in its own field. JanitorAI renders
+                  // reasoning_content natively as the collapsible ". . . thinking" box.
+                  // Never glue reasoning into the story text.
+                  delta.content = content || '';
+                  if (reasoning) {
+                    // Newer NIM builds emit `reasoning`; normalize to reasoning_content
+                    delta.reasoning_content = reasoning;
+                    delete delta.reasoning;
+                  } else {
+                    delete delta.reasoning_content;
+                    delete delta.reasoning;
                   }
-                  if (content && reasoningStarted) {
-                    combinedContent += '\n</IMD>\n\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-                  if (combinedContent) {
-                    delta.content = combinedContent;
-                  }
-                  delete delta.reasoning_content;
-                  delete delta.reasoning;
                 } else {
                   delta.content = content || '';
                   delete delta.reasoning_content;
@@ -507,15 +502,17 @@ app.post('/v1/chat/completions', async (req, res) => {
           let fullContent = choice.message?.content || '';
           fullContent = stripUserBreakout(fullContent);
           const reasoningText = choice.message?.reasoning_content ?? choice.message?.reasoning;
+          const replyMessage = {
+            role: choice.message.role,
+            content: fullContent
+          };
           if (SHOW_REASONING && reasoningText) {
-            fullContent = '<imd>\n' + reasoningText + '\n</IMD>\n\n' + fullContent;
+            // Reasoning travels in its own field — JanitorAI renders it as the thinking box
+            replyMessage.reasoning_content = reasoningText;
           }
           return {
             index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
+            message: replyMessage,
             finish_reason: choice.finish_reason
           };
         }),
