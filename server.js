@@ -1,13 +1,16 @@
 // server.js - OpenAI to NVIDIA NIM API Proxy (Optimized for Janitor AI)
-// v3.3 — YOUR v3.0 code with four additions (nothing removed):
-//   1. CUSTOM PROMPT from prompt.txt: your narrator rules injected server-side into every
+// v3.4 — six additions on top of v3.0 (nothing removed):
+//   1. CUSTOM PROMPT from prompt.txt: narrator rules injected server-side into every
 //      request. Read from a FILE, not an env var — big env vars crash Render with
 //      "exec /bin/bash: argument list too long".
 //   2. ENABLE_THINKING_MODE=off: forces thinking OFF on thinking models, so the whole
 //      token budget goes to the story instead of hidden reasoning
 //   3. REASONING_EFFORT env var (optional): sends reasoning_effort to models that support it
-//   4. SHOW_REASONING now passes reasoning through in the reasoning_content field, which
+//   4. SHOW_REASONING passes reasoning through in the reasoning_content field, which
 //      JanitorAI renders natively as the collapsible ". . . thinking" box.
+//   5. CLIENT_AUTH_KEY: proxy password — requests without the right password get 401.
+//   6. reasoning_effort pass-through: if JanitorAI's thinking levels send a value,
+//      it wins over the REASONING_EFFORT env var (the env var becomes the fallback).
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -23,6 +26,11 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
+
+// 🔐 CLIENT AUTH - proxy password. Set CLIENT_AUTH_KEY in Render env vars.
+// If set, every request must send this password as the API key (Authorization: Bearer ...).
+// If unset, the proxy is open — anyone with the URL can use your NVIDIA key. Not recommended.
+const CLIENT_AUTH_KEY = (process.env.CLIENT_AUTH_KEY || '').trim();
 
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true' || false;
@@ -56,8 +64,26 @@ const MAX_FALLBACK_ATTEMPTS = parseInt(process.env.MAX_FALLBACK_ATTEMPTS, 10) ||
 // Upstream request timeout (ms). A hung model falls through to the next one.
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS, 10) || 60000;
 
-// If true, still try mapped models that are missing from NVIDIA's public model list (e.g. gated ones like Kimi K3)
+// If true, still try mapped models that are missing from NVIDIA's public model list (e.g. gated ones)
 const ALLOW_UNLISTED_MODELS = process.env.ALLOW_UNLISTED_MODELS === 'true';
+
+// 🔐 AUTH CHECK - runs before every /v1 request. JanitorAI sends whatever you typed
+// in its "API Key" field as a Bearer token, so that field becomes your proxy password.
+app.use('/v1', (req, res, next) => {
+  if (!CLIENT_AUTH_KEY) return next(); // no password configured = open proxy
+  const provided = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+  if (provided !== CLIENT_AUTH_KEY) {
+    console.warn(`🚫 Rejected ${req.method} ${req.path} — wrong or missing proxy password`);
+    return res.status(401).json({
+      error: {
+        message: 'Invalid API key. This proxy is private. Type the proxy password in the API Key field.',
+        type: 'authentication_error',
+        code: 401
+      }
+    });
+  }
+  next();
+});
 
 // 🎯 MODEL MAPPING — updated October 2026
 const MODEL_MAPPING = {
@@ -131,11 +157,7 @@ async function refreshLiveModels() {
     if (ids.length > 0) {
       liveModels = new Set(ids);
       liveModelsAt = new Date().toISOString();
-      const dead = Object.values(MODEL_MAPPING).filter((v, i, a) => a.indexOf(v) === i && !liveModels.has(v));
       console.log(`📡 Loaded ${ids.length} live NIM models`);
-      if (dead.length) {
-        console.warn(`⚠️  Mapped but not in public model list (may still work if gated, or may be gone): ${dead.join(', ')}`);
-      }
     }
   } catch (e) {
     console.warn(`⚠️  Could not refresh NIM model list: ${e.message} (using static lists)`);
@@ -208,7 +230,7 @@ const THINKING_MODELS = [
 // THINKING_MODE === 'true'  -> thinking ON
 // THINKING_MODE === 'off'   -> thinking OFF (the whole max_tokens budget goes to the story)
 // anything else             -> model default (no switch sent)
-function applyThinkingMode(nimRequest) {
+function applyThinkingMode(nimRequest, effort) {
   const m = nimRequest.model;
   if (!THINKING_MODELS.includes(m)) return;
   if (THINKING_MODE === 'true' || THINKING_MODE === 'off') {
@@ -219,11 +241,13 @@ function applyThinkingMode(nimRequest) {
       nimRequest.chat_template_kwargs = { enable_thinking: on };
     }
   }
-  if (REASONING_EFFORT) nimRequest.reasoning_effort = REASONING_EFFORT;
+  // What JanitorAI's thinking levels send wins; the env var is only the fallback
+  const effectiveEffort = effort || REASONING_EFFORT;
+  if (effectiveEffort) nimRequest.reasoning_effort = effectiveEffort;
 }
 
 // 🔄 Helper: make a NIM request with automatic fallback (429 / 5xx / 404 / 410 / timeout)
-async function makeNimRequest(nimRequest, stream) {
+async function makeNimRequest(nimRequest, stream, effort) {
   const fallbacks = FALLBACK_CHAIN.filter(m => m !== nimRequest.model && isLive(m));
   let primary = [nimRequest.model];
   if (!isLive(nimRequest.model) && !ALLOW_UNLISTED_MODELS) {
@@ -238,7 +262,7 @@ async function makeNimRequest(nimRequest, stream) {
 
     // chat_template_kwargs are model-specific — recompute for the fallback model
     delete attemptRequest.chat_template_kwargs;
-    applyThinkingMode(attemptRequest);
+    applyThinkingMode(attemptRequest, effort);
 
     const startedAt = Date.now();
     console.log(`➡️  Trying ${modelAttempt} (attempt ${i + 1}/${modelsToTry.length})`);
@@ -304,6 +328,7 @@ app.get('/health', (req, res) => {
     reasoning_effort: REASONING_EFFORT || null,
     custom_prompt_injected: !!CUSTOM_PROMPT,
     custom_prompt_source: require('fs').existsSync(require('path').join(__dirname, 'prompt.txt')) ? 'prompt.txt' : (CUSTOM_PROMPT ? 'env' : 'none'),
+    client_auth: !!CLIENT_AUTH_KEY,
     nim_api_configured: !!NIM_API_KEY,
     available_models: Object.keys(MODEL_MAPPING).length,
     live_nim_models: liveModels ? liveModels.size : null,
@@ -317,7 +342,7 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'OpenAI to NVIDIA NIM Proxy',
-    version: '3.1',
+    version: '3.4',
     optimized_for: 'Janitor AI',
     status: 'running',
     endpoints: {
@@ -326,7 +351,7 @@ app.get('/', (req, res) => {
       chat: '/v1/chat/completions'
     },
     featured_models: {
-      best_quality:   'gpt-4 → z-ai/glm-5.3 (1M ctx)',
+      best_quality:   'glm-5.3 → z-ai/glm-5.3 (1M ctx)',
       best_roleplay:  'glm-5.3 / gpt-4o → z-ai/glm-5.3 (1M ctx)',
       newest_big:     'kimi-k3 → moonshotai/kimi-k3 (often rate limited)',
       most_popular:   'gpt-3.5-turbo → nemotron-3-ultra-550b',
@@ -367,7 +392,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const { model, messages, temperature, max_tokens, stream,
-            top_p, frequency_penalty, presence_penalty, stop, seed } = req.body;
+            top_p, frequency_penalty, presence_penalty, stop, seed,
+            reasoning_effort } = req.body;
 
     const nimModel = resolveModel(model);
 
@@ -405,7 +431,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (seed !== undefined) nimRequest.seed = seed;
 
     // 🔄 Use fallback-aware request helper (applies thinking mode per model)
-    const response = await makeNimRequest(nimRequest, stream || false);
+    const response = await makeNimRequest(nimRequest, stream || false, reasoning_effort);
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -569,7 +595,7 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', async () => {
   console.log('═══════════════════════════════════════════════════════');
-  console.log('🚀 OpenAI → NVIDIA NIM Proxy (Janitor AI Optimized) v3.1');
+  console.log('🚀 OpenAI → NVIDIA NIM Proxy (Janitor AI Optimized) v3.4');
   console.log('═══════════════════════════════════════════════════════');
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🏥 Health check: http://localhost:${PORT}/health`);
@@ -580,15 +606,15 @@ app.listen(PORT, '0.0.0.0', async () => {
   console.log(`   • Thinking mode:     ${THINKING_MODE}`);
   console.log(`   • Reasoning effort:  ${REASONING_EFFORT || 'default'}`);
   console.log(`   • Custom prompt:     ${CUSTOM_PROMPT ? '✅ INJECTED' : '❌ none'}`);
+  console.log(`   • Proxy password:    ${CLIENT_AUTH_KEY ? '✅ ENABLED' : '❌ DISABLED — set CLIENT_AUTH_KEY!'}`);
   console.log(`   • API key:           ${NIM_API_KEY ? '✅ Configured' : '❌ Missing'}`);
   console.log(`   • Max tokens:        12000 (default)`);
   console.log(`   • Fallback triggers: ${[...FALLBACK_STATUSES].join(', ')} + timeout`);
   console.log(`   • Max attempts:      ${MAX_FALLBACK_ATTEMPTS}`);
   console.log('');
   console.log('🎯 Main Aliases (October 2026):');
-  console.log('   • gpt-4            → GLM-5.3');
-  console.log('   • gpt-4o           → GLM-5.3');
-  console.log('   • glm-flash        → GLM-5.3 Flash');
+  console.log('   • glm-5.3          → GLM-5.3 (1M ctx)');
+  console.log('   • glm-flash        → GLM-5.3 Flash (fast)');
   console.log('   • deepseek-flash   → DeepSeek V4.1 Flash');
   console.log('   • kimi-k3          → Kimi K3 (often 429 on free tier)');
   console.log('   • gpt-3.5-turbo    → Nemotron 3 Ultra 550B');
